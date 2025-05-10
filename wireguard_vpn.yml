@@ -1,0 +1,280 @@
+# AWS Wireguard VPN for Remote PC Access
+
+# Configure AWS provider
+provider "aws" {
+  region = var.region
+}
+
+# Variables
+variable "region" {
+  description = "AWS region"
+  default     = "us-east-1"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR for VPC"
+  default     = "10.1.0.0/16"
+}
+
+variable "subnet_cidr" {
+  description = "CIDR for subnet"
+  default     = "10.1.1.0/24"
+}
+
+variable "key_name" {
+  description = "SSH key name"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  default     = "t2.micro"
+}
+
+variable "my_ip" {
+  description = "Your IP address to allow SSH access"
+  type        = string
+}
+
+variable "home_pc_ip" {
+  description = "Your home PC's public IP address"
+  type        = string
+}
+
+# Create VPC
+resource "aws_vpc" "wireguard_vpc" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  
+  tags = {
+    Name = "wireguard-vpc"
+  }
+}
+
+# Create Internet Gateway
+resource "aws_internet_gateway" "wireguard_igw" {
+  vpc_id = aws_vpc.wireguard_vpc.id
+  
+  tags = {
+    Name = "wireguard-igw"
+  }
+}
+
+# Create Subnet
+resource "aws_subnet" "wireguard_subnet" {
+  vpc_id                  = aws_vpc.wireguard_vpc.id
+  cidr_block              = var.subnet_cidr
+  map_public_ip_on_launch = true
+  availability_zone       = "${var.region}a"
+  
+  tags = {
+    Name = "wireguard-subnet"
+  }
+}
+
+# Create Route Table
+resource "aws_route_table" "wireguard_route_table" {
+  vpc_id = aws_vpc.wireguard_vpc.id
+  
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.wireguard_igw.id
+  }
+  
+  tags = {
+    Name = "wireguard-route-table"
+  }
+}
+
+# Associate Route Table to Subnet
+resource "aws_route_table_association" "wireguard_rta" {
+  subnet_id      = aws_subnet.wireguard_subnet.id
+  route_table_id = aws_route_table.wireguard_route_table.id
+}
+
+# Security Group for Wireguard
+resource "aws_security_group" "wireguard_sg" {
+  name        = "wireguard-security-group"
+  description = "Security group for Wireguard VPN server"
+  vpc_id      = aws_vpc.wireguard_vpc.id
+  
+  # SSH access from your IP
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["${var.my_ip}/32"]
+    description = "SSH access"
+  }
+  
+  # Wireguard access from anywhere
+  ingress {
+    from_port   = 51820
+    to_port     = 51820
+    protocol    = "udp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Wireguard UDP"
+  }
+  
+  # Allow all outbound traffic
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "wireguard-sg"
+  }
+}
+
+# Get latest Ubuntu 22.04 AMI
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+  
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+  
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# Create EC2 instance for Wireguard
+resource "aws_instance" "wireguard" {
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  key_name               = var.key_name
+  subnet_id              = aws_subnet.wireguard_subnet.id
+  vpc_security_group_ids = [aws_security_group.wireguard_sg.id]
+  
+  user_data = <<-EOF
+              #!/bin/bash
+              apt-get update
+              apt-get install -y wireguard qrencode
+              
+              # Enable IP forwarding
+              echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
+              sysctl -p /etc/sysctl.d/99-wireguard.conf
+              
+              # Generate server keys
+              mkdir -p /etc/wireguard
+              cd /etc/wireguard
+              wg genkey | tee server_private.key | wg pubkey > server_public.key
+              chmod 600 server_private.key
+              
+              # Generate client keys
+              wg genkey | tee client_private.key | wg pubkey > client_public.key
+              chmod 600 client_private.key
+              
+              # Generate home PC keys
+              wg genkey | tee homepc_private.key | wg pubkey > homepc_public.key
+              chmod 600 homepc_private.key
+              
+              # Set variables
+              SERVER_PRIVATE_KEY=$(cat server_private.key)
+              CLIENT_PUBLIC_KEY=$(cat client_public.key)
+              HOMEPC_PUBLIC_KEY=$(cat homepc_public.key)
+              SERVER_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+              
+              # Create server config
+              cat > /etc/wireguard/wg0.conf <<EOL
+              [Interface]
+              PrivateKey = $SERVER_PRIVATE_KEY
+              Address = 10.66.66.1/24
+              ListenPort = 51820
+              PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+              PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+              
+              # Client config (for mobile devices)
+              [Peer]
+              PublicKey = $CLIENT_PUBLIC_KEY
+              AllowedIPs = 10.66.66.2/32
+              
+              # Home PC config
+              [Peer]
+              PublicKey = $HOMEPC_PUBLIC_KEY
+              AllowedIPs = 10.66.66.3/32
+              EOL
+              
+              # Create client config
+              cat > /etc/wireguard/client.conf <<EOL
+              [Interface]
+              PrivateKey = $(cat client_private.key)
+              Address = 10.66.66.2/24
+              DNS = 8.8.8.8, 8.8.4.4
+              
+              [Peer]
+              PublicKey = $(cat server_public.key)
+              Endpoint = $SERVER_IP:51820
+              AllowedIPs = 0.0.0.0/0
+              PersistentKeepalive = 25
+              EOL
+              
+              # Create home PC config
+              cat > /etc/wireguard/homepc.conf <<EOL
+              [Interface]
+              PrivateKey = $(cat homepc_private.key)
+              Address = 10.66.66.3/24
+              
+              [Peer]
+              PublicKey = $(cat server_public.key)
+              Endpoint = $SERVER_IP:51820
+              AllowedIPs = 10.66.66.0/24
+              PersistentKeepalive = 25
+              EOL
+              
+              # Enable and start Wireguard
+              systemctl enable wg-quick@wg0
+              systemctl start wg-quick@wg0
+              
+              # Generate QR code for mobile client
+              qrencode -t ansiutf8 < /etc/wireguard/client.conf > /etc/wireguard/client_qr.txt
+              EOF
+  
+  root_block_device {
+    volume_size = 10
+    volume_type = "gp2"
+  }
+  
+  tags = {
+    Name = "wireguard-server"
+  }
+}
+
+# Output the server's public IP
+output "wireguard_server_ip" {
+  value = aws_instance.wireguard.public_ip
+}
+
+# Instructions output
+output "wireguard_instructions" {
+  value = <<EOF
+    
+    Wireguard VPN server has been deployed.
+    
+    To access your Wireguard server:
+    1. SSH into the server: ssh -i your-key.pem ubuntu@${aws_instance.wireguard.public_ip}
+    
+    For mobile devices:
+    1. Get the client config: ssh -i your-key.pem ubuntu@${aws_instance.wireguard.public_ip} "cat /etc/wireguard/client.conf"
+    2. Or scan the QR code displayed by: ssh -i your-key.pem ubuntu@${aws_instance.wireguard.public_ip} "cat /etc/wireguard/client_qr.txt"
+    
+    For your home PC:
+    1. Get the homepc config: ssh -i your-key.pem ubuntu@${aws_instance.wireguard.public_ip} "cat /etc/wireguard/homepc.conf"
+    2. Install Wireguard on your home PC
+    3. Create a new tunnel with the contents of homepc.conf
+    4. Start the tunnel
+    
+    To connect to your home PC from anywhere:
+    1. Connect to the Wireguard VPN using your client device
+    2. Your home PC will be accessible at 10.66.66.3
+    
+  EOF
+}
